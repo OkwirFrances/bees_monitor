@@ -1,0 +1,63 @@
+# ---------- Secrets ----------
+# Never commit real credentials (WiFi, API keys, tokens)
+src/secrets.h
+
+# ---------- Backup files ----------
+*.bak
+*.orig
+*.rej
+*~
+*.swp
+*.swo
+
+# ---------- PlatformIO ----------
+.pio/
+.pioenvs/
+.piolibdeps/
+.pio/build/
+.pio/libdeps/
+*.pioenvs
+*.piolibdeps
+
+# ---------- Build artifacts ----------
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.a
+*.d
+build/
+Debug/
+Release/
+
+# ---------- VS Code ----------
+# Keep extensions.json / settings.json if you want to share them.
+# Ignore machine-specific and generated files:
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch/
+*.code-workspace
+
+# ---------- C/C++ / CMake ----------
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.cache/
+*.gcda
+*.gcno
+*.gcov
+
+# ---------- OS junk ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Logs / temp ----------
+*.log
+*.tmp
+*.temp
+*.bak
+tmp/
