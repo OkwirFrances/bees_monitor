@@ -1145,7 +1145,7 @@ static CsvStats uploadCsvToAws(unsigned long budgetEndMs)
 
         strcpy(work, raw);
         Sample s;
-        if (!parseCsvRow(work, LOCAL_OFFSET_SEC, at, s))
+        if (!parseCsvRow(work, 0, at, s))
         {
             quarantineRow(raw); st.skipped++; continue;
         }
