@@ -1115,6 +1115,10 @@ static uint32_t       pendingDropped = 0;
 enum LogResult { LOG_FAILED = 0, LOG_SAVED = 1, LOG_BUFFERED = 2 };
 
 // Row: local timestamp,t1,h1,t2,h2,co2   (an EMPTY field means "not measured")
+//
+// Writer half of the timestamp contract. The reader is parseCsvRow(), which recovers UTC via
+// civilToEpoch() with NO offset subtraction. If you change the offset here you must change the
+// reader too, and verify recorded_at on the wire is still UTC (it must match time(nullptr)).
 static int formatCsvRow(char *row, size_t cap, int64_t epoch, const Sample &s)
 {
     char stamp[24], a[4][12], c[8];
@@ -1139,7 +1143,7 @@ static bool optFloat(const char *s, float lo, float hi, float &out)
 }
 
 // Parses a CSV row (empty fields allowed). Fills the UTC ISO timestamp used as the dedupe key.
-static bool parseCsvRow(char *line, long tzOffsetSec, char *isoOut, Sample &s)
+static bool parseCsvRow(char *line, char *isoOut, Sample &s)
 {
     size_t L = strlen(line);
     while (L && (line[L - 1] == '\r' || line[L - 1] == '\n' || line[L - 1] == ' ' || line[L - 1] == '\t')) line[--L] = 0;
@@ -1163,7 +1167,7 @@ static bool parseCsvRow(char *line, long tzOffsetSec, char *isoOut, Sample &s)
     if (y < 2024) return false;
     int64_t epoch = 0;
     if (!hu::civilToEpoch(y, mo, d, hh, mi, ss, epoch)) return false;
-    hu::epochToIso(epoch - tzOffsetSec, isoOut);
+    hu::epochToIso(epoch, isoOut);
 
     if (!optFloat(f[1], -40, 85, s.t1)) return false;
     if (!optFloat(f[2], 0, 100, s.h1)) return false;
@@ -1454,7 +1458,7 @@ static CsvStats uploadCsvToAws(unsigned long budgetEndMs)
 
         strcpy(work, raw);
         Sample s;
-        if (!parseCsvRow(work, LOCAL_OFFSET_SEC, at, s))
+        if (!parseCsvRow(work, at, s))
         {
             quarantineRow(raw); st.skipped++; continue;
         }
