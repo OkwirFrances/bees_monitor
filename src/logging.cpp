@@ -7,8 +7,8 @@
 // ======================================================
 // LOG BUFFERS (RAM ring buffers shown on the dashboard)
 // ======================================================
-#define LOG_RING      80    // every line, newest overwrite oldest
-#define PROBLEM_RING  20    // warnings + errors only, so they are not pushed out by chatty info lines
+#define LOG_RING      60    // every line, newest overwrite oldest (the browser keeps its own history)
+#define PROBLEM_RING  16    // warnings + errors only, so they are not pushed out by chatty info lines
 #define LOG_TEXT_LEN  128   // longer lines are truncated on the dashboard (Serial still gets the full line)
 
 struct LogEntry
@@ -24,6 +24,8 @@ static LogEntry  problemRing[PROBLEM_RING];
 static uint32_t  logSeq = 0;         // sequence number of the newest line (first line is 1)
 static uint32_t  problemTotal = 0;   // how many warnings/errors were ever stored
 static uint32_t  bootId = 0;         // lets the browser notice that the device rebooted
+static LogSink   sink = nullptr;
+static bool      inSink = false;
 
 static const time_t MIN_VALID_EPOCH = 1735689600; // 2025-01-01
 
@@ -44,6 +46,8 @@ static void makeStamp(char *ts /* >= 9 bytes */)
     }
 }
 
+void logSetSink(LogSink fn) { sink = fn; }
+
 void logMsg(uint8_t level, const char *msg)
 {
     if (!msg) return;
@@ -62,21 +66,30 @@ void logMsg(uint8_t level, const char *msg)
     }
 
     // ---- RAM copy for the dashboard (leading/trailing newlines removed) ----
-    while (*msg == '\n' || *msg == '\r') msg++;
-    if (!*msg) return;
+    const char *m = msg;
+    while (*m == '\n' || *m == '\r') m++;
+    if (!*m) return;
 
     const uint32_t seq = ++logSeq;
     LogEntry &e = logRing[(seq - 1) % LOG_RING];
     e.seq = seq;
     e.level = level;
     memcpy(e.ts, ts, sizeof(e.ts));
-    strncpy(e.text, msg, LOG_TEXT_LEN - 1);
+    strncpy(e.text, m, LOG_TEXT_LEN - 1);
     e.text[LOG_TEXT_LEN - 1] = 0;
     size_t n = strlen(e.text);
     while (n && (e.text[n - 1] == '\n' || e.text[n - 1] == '\r')) e.text[--n] = 0;
 
     if (level == LV_WARN || level == LV_ERR)
         problemRing[problemTotal++ % PROBLEM_RING] = e;
+
+    // ---- persistent sink (SD card). Guarded: the sink itself may log (e.g. an SD fault). ----
+    if (sink && !inSink)
+    {
+        inSink = true;
+        sink(level, e.text);
+        inSink = false;
+    }
 }
 
 void logPrintf(uint8_t level, const char *fmt, ...)
@@ -94,62 +107,54 @@ void addError(String msg)
     logMsg(LV_ERR, msg.c_str());
 }
 
-// Appends s as the body of a JSON string (quotes, backslashes and control
-// characters escaped: an unescaped quote used to break the whole reply).
-static void appendJsonEscaped(String &out, const char *s)
+// Escapes s into dst as the body of a JSON string. Returns the number of bytes written.
+static size_t escapeInto(char *dst, size_t n, const char *s)
 {
-    for (; *s; s++)
+    size_t o = 0;
+    for (; *s && o + 3 < n; s++)
     {
         const char c = *s;
-        if (c == '"' || c == '\\') { out += '\\'; out += c; }
-        else if (c == '\n')        out += "\\n";
-        else if (c == '\r')        out += "\\r";
-        else if (c == '\t')        out += "\\t";
-        else if ((unsigned char)c < 0x20) out += ' ';
-        else                       out += c;
+        if (c == '"' || c == '\\') { dst[o++] = '\\'; dst[o++] = c; }
+        else if ((unsigned char)c < 0x20) { dst[o++] = ' '; }
+        else dst[o++] = c;
     }
+    if (n) dst[o] = 0;
+    return o;
 }
 
 // =====================================================
 // API ENDPOINT FOR THE DASHBOARD LOG PANEL
 // {"boot":123,"last":57,"logs":[{"s":55,"t":"10:30:37","l":1,"m":"..."},...]}
-// l: 0 info, 1 ok, 2 warn, 3 error, 4 debug.   Sent in chunks: no big String needed.
+// l: 0 info, 1 ok, 2 warn, 3 error, 4 debug.
+// Streamed from a static buffer in chunks: no heap is allocated per request (a dashboard that
+// polls every few seconds must not fragment the heap that the TLS handshake needs).
 // =====================================================
+static char outBuf[1500];
+
 void handleLogs()
 {
     const bool problems = server.hasArg("problems");
     const uint32_t since = (uint32_t)server.arg("since").toInt();
 
+    server.sendHeader("Cache-Control", "no-store");
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
 
-    String out;
-    out.reserve(1400);
-    out = "{\"boot\":";
-    out += String((unsigned long)bootId);
-    out += ",\"last\":";
-    out += String((unsigned long)logSeq);
-    out += ",\"logs\":[";
-
+    size_t o = snprintf(outBuf, sizeof(outBuf), "{\"boot\":%lu,\"last\":%lu,\"logs\":[",
+                        (unsigned long)bootId, (unsigned long)logSeq);
     bool first = true;
+
+    auto flush = [&]() { if (o) { server.sendContent(outBuf, o); o = 0; } };
     auto emit = [&](const LogEntry &e)
     {
-        if (!first) out += ",";
+        if (o + 340 > sizeof(outBuf)) flush();          // one entry is at most ~310 bytes
+        if (!first) outBuf[o++] = ',';
         first = false;
-        out += "{\"s\":";
-        out += String((unsigned long)e.seq);
-        out += ",\"t\":\"";
-        out += e.ts;
-        out += "\",\"l\":";
-        out += String((int)e.level);
-        out += ",\"m\":\"";
-        appendJsonEscaped(out, e.text);
-        out += "\"}";
-        if (out.length() > 1100)
-        {
-            server.sendContent(out);
-            out = "";
-        }
+        o += snprintf(outBuf + o, sizeof(outBuf) - o, "{\"s\":%lu,\"t\":\"%s\",\"l\":%u,\"m\":\"",
+                      (unsigned long)e.seq, e.ts, (unsigned)e.level);
+        o += escapeInto(outBuf + o, sizeof(outBuf) - o, e.text);
+        outBuf[o++] = '"';
+        outBuf[o++] = '}';
     };
 
     if (problems)
@@ -166,7 +171,9 @@ void handleLogs()
         for (uint32_t s = from; s <= logSeq; s++) emit(logRing[(s - 1) % LOG_RING]);
     }
 
-    out += "]}";
-    server.sendContent(out);
+    if (o + 4 > sizeof(outBuf)) flush();
+    outBuf[o++] = ']';
+    outBuf[o++] = '}';
+    flush();
     server.sendContent("");   // ends the chunked reply
 }

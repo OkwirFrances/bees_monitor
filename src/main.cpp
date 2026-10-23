@@ -23,7 +23,11 @@
 //     when complete, so partial files are never queued.
 //   * Task watchdog, reset-reason reporting, heap guard, exponential backoff
 //     with jitter, SD auto-remount, bounded queues (drop-oldest for media).
-//   * HTTPS only. Credentials come from secrets.h (see bottom of this file).
+//   * HTTPS only. Compile-time defaults come from secrets.h; the Wi-Fi (MiFi) network can be
+//     changed on the dashboard (Settings > Internet connection) and is kept in NVS.
+//   * Warnings/errors/boots are also appended to /events.log on the SD card (survives reboots).
+//   * Power: 160 MHz CPU, microphone only powered for recordings (and for the dashboard while
+//     someone is looking), adaptive Wi-Fi TX power, station interface never torn down.
 //
 //  Build flags (platformio.ini):
 //     -DHIVE_DEBUG=0 -DCORE_DEBUG_LEVEL=0
@@ -60,6 +64,7 @@
 #include <Preferences.h>
 #include "dashboard.h"
 #include "settings.h"
+#include "ui_common.h"
 #include "connection.h"
 #include "logging.h"   // declares extern gmtOffset_sec / daylightOffset_sec BEFORE they are defined below
 #include "hive_util.h"
@@ -108,8 +113,13 @@ Preferences prefs;
 #define HIVE_ADEMNEA_KEY HIVE_GATEWAY_KEY
 #endif
 
-const char *ssid     = WIFI_SSID;
-const char *password = WIFI_PASS;
+// Station (router / MiFi) credentials. secrets.h holds the factory default; a network saved on the
+// dashboard is loaded from NVS at boot (loadWifiCredentials). connection.cpp reads ssid/password.
+char staSsid[33] = WIFI_SSID;
+char staPass[65] = WIFI_PASS;
+const char *ssid     = staSsid;
+const char *password = staPass;
+static bool wifiIsCustom = false;
 
 static const char *AWS_API_BASE   = GATEWAY_BASE_URL;
 static const char *ADEMNEA_BASE   = ADEMNEA_BASE_URL;
@@ -146,7 +156,17 @@ String hiveNo = "1";
 #define REJECTED_CSV_MAX_BYTES 200000UL
 #define NTP_RESYNC_MS          43200000UL
 #define NTP_FAIL_RETRY_MS      3600000UL
-#define MIN_TLS_HEAP           45000
+#define MIN_TLS_HEAP           32000   // largest free block needed to start a TLS session
+#define HEAP_RETRY_MS          30000UL // heap-low windows are retried soon: not a network failure
+#define OFFLINE_RESTART_STREAK 8       // windows in a row that could not join Wi-Fi -> restart (rebuilds the radio stack)
+#define AUDIO_PEAK_STALE_MS    20000UL // dashboard open: refresh the audio peak at most this often
+#define EVENT_LOG_MAX          100000UL
+#ifndef HIVE_CPU_MHZ
+#define HIVE_CPU_MHZ           160     // 240 MHz buys nothing here; 160 saves ~30 % CPU current
+#endif
+#ifndef HIVE_ADAPTIVE_TX
+#define HIVE_ADAPTIVE_TX       1       // lower Wi-Fi TX power while uploading on a strong link
+#endif
 #define LOW_HEAP_RESTARTS      3
 #define SD_RETRY_MS            60000UL
 #define HEALTH_PRINT_MS        60000UL
@@ -284,6 +304,13 @@ static bool          heartbeatEverSent = false;
 static bool          everSynced = false;
 static uint8_t       hbLevel = 2;   // heartbeat payload: 2 = mac + voltage/current/chip, 1 = mac only, 0 = documented fields only
 static bool          wokeFromSleep = false;
+static int8_t        staLastResult = 0;      // 0 never tried, 1 joined, -1 failed
+static unsigned long staLastAt = 0;
+static uint8_t       staFailStreak = 0;      // consecutive windows that could not join the network
+static bool          everUploaded = false;
+static unsigned long lastUploadOkAt = 0;
+static bool          micPeakRequested = false;
+static unsigned long audioPeakAt = 0;
 
 // dashboard snapshot (display only; the CSV gets raw values)
 static float    dispT1 = NAN, dispH1 = NAN, dispT2 = NAN, dispH2 = NAN;
@@ -495,11 +522,36 @@ static void logDeviceIdentity()
     logMsg(LV_INFO, "-------------------------");
 }
 
+// Uploading is mostly transmitting, and transmit current grows steeply with TX power
+// (about 240 mA at 19.5 dBm, about 190 mA at 15 dBm). On a strong link a lower power is enough.
+static void applyTxPower()
+{
+#if HIVE_ADAPTIVE_TX
+    const int rssi = WiFi.RSSI();
+    wifi_power_t p = WIFI_POWER_19_5dBm;
+    if      (rssi >= -55) p = WIFI_POWER_11dBm;
+    else if (rssi >= -65) p = WIFI_POWER_15dBm;
+    else if (rssi >= -75) p = WIFI_POWER_17dBm;
+    WiFi.setTxPower(p);
+#endif
+}
+// Back to full power afterwards so the dashboard access point keeps its normal range.
+static void restoreTxPower()
+{
+#if HIVE_ADAPTIVE_TX
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+#endif
+}
+
 // Connect STA unless it is already up.
 static bool staEnsure()
 {
     if (WiFi.status() == WL_CONNECTED) return true;
-    return connectSTA();   // connection.cpp, bounded
+    const bool ok = connectSTA();   // connection.cpp, bounded
+    staLastResult = ok ? 1 : -1;
+    staLastAt = millis();
+    if (ok) applyTxPower();
+    return ok;
 }
 
 // ============================================================================
@@ -553,13 +605,24 @@ static void syncClockIfNeeded()
 {
     if (!reached(ntpNextAttempt)) return;
 
-    sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
-    setupTime();   // connection.cpp, bounded
-    bool ok = (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
+    // Some MiFi / mobile networks block UDP 123, so NTP never answers there and every attempt
+    // wastes up to 8 s of radio time. Remember which method worked and try it first.
+    static bool preferHttpDate = false;
+    const int minDelta = clockSynced() ? RTC_CORRECT_THRESHOLD_S : 0;
+    bool ok = false;
+    if (preferHttpDate) ok = syncClockFromHttpDate(minDelta);
     if (!ok)
     {
-        DBG("CLOCK: NTP gave no answer, trying the HTTPS Date header");
-        ok = syncClockFromHttpDate(clockSynced() ? RTC_CORRECT_THRESHOLD_S : 0);
+        sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+        setupTime();   // connection.cpp, bounded
+        ok = (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
+        if (ok) preferHttpDate = false;
+        else
+        {
+            DBG("CLOCK: NTP gave no answer, trying the HTTPS Date header");
+            ok = syncClockFromHttpDate(minDelta);
+            if (ok) preferHttpDate = true;
+        }
     }
 
     if (ok && clockSynced())
@@ -659,9 +722,78 @@ static void loadSettings()
     fullDutyCycle  = prefs.getBool("fullDuty", false);
 }
 
-void handleRoot()         { server.send_P(200, "text/html", INDEX_HTML); }
-void handleSettingsPage() { server.send_P(200, "text/html", SETTINGS_HTML); }
+// ============================================================================
+// WEB UI: pages, JSON endpoints, Wi-Fi (MiFi) settings, maintenance actions
+// All JSON is built in static buffers: a dashboard that polls every few seconds must not
+// churn the heap that the TLS handshake needs.
+// ============================================================================
+static float sdUsagePercent();   // defined in the SD section below
 
+static const char *EVENT_LOG = "/events.log";
+static const char *EVENT_OLD = "/events.old";
+
+// Warnings, errors and boot lines are also appended to the SD card so they survive a reboot
+// ("what happened while nobody was at the hive?"). Registered with logSetSink().
+static void eventSink(uint8_t level, const char *msg)
+{
+    const bool boot = strncmp(msg, "[BOOT]", 6) == 0;
+    if (!sd_ok || !(level == LV_WARN || level == LV_ERR || boot)) return;
+    File f = SD.open(EVENT_LOG, FILE_APPEND);
+    if (!f) return;
+    if (f.size() > EVENT_LOG_MAX)
+    {
+        f.close();
+        SD.remove(EVENT_OLD);
+        SD.rename(EVENT_LOG, EVENT_OLD);
+        f = SD.open(EVENT_LOG, FILE_APPEND);
+        if (!f) return;
+    }
+    f.printf("%s %s %s\n", getTimestamp().c_str(),
+             level == LV_ERR ? "ERR " : level == LV_WARN ? "WARN" : "INFO", msg);
+    f.close();
+}
+
+// Escapes src into dst as the body of a JSON string. Always terminates dst.
+static size_t jsonEsc(char *dst, size_t n, const char *src)
+{
+    size_t o = 0;
+    for (; *src && o + 3 < n; src++)
+    {
+        const unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') { dst[o++] = '\\'; dst[o++] = (char)c; }
+        else if (c < 0x20)         { dst[o++] = ' '; }
+        else                       { dst[o++] = (char)c; }
+    }
+    if (n) dst[o] = 0;
+    return o;
+}
+
+static void sendJsonBuf(int code, const char *buf)
+{
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(code, "application/json", buf);
+}
+
+static void sendResult(int code, bool ok, const char *msg)
+{
+    char m[120], b[180];
+    jsonEsc(m, sizeof(m), msg);
+    snprintf(b, sizeof(b), "{\"ok\":%s,\"msg\":\"%s\"}", ok ? "true" : "false", m);
+    sendJsonBuf(code, b);
+}
+
+static void sendAsset(const char *type, const char *body, bool cacheable)
+{
+    server.sendHeader("Cache-Control", cacheable ? "public, max-age=300" : "no-cache");
+    server.send_P(200, type, body);
+}
+
+void handleRoot()         { sendAsset("text/html", INDEX_HTML, false); }
+void handleSettingsPage() { sendAsset("text/html", SETTINGS_HTML, false); }
+void handleCss()          { sendAsset("text/css", APP_CSS, true); }
+void handleJs()           { sendAsset("application/javascript", APP_JS, true); }
+
+// ---- schedule ---------------------------------------------------------------
 void handleSetDuty()
 {
     if (server.hasArg("sensor"))
@@ -684,43 +816,220 @@ void handleSetDuty()
     logPrintf(LV_OK, "Settings updated from UI: sensor %lus  record %lus  upload %lus  mode %s",
               sensorInterval / 1000UL, recordInterval, uploadInterval / 1000UL,
               fullDutyCycle ? "duty-cycle" : "normal");
-    server.send(200, "text/plain", "Settings saved");
+    sendResult(200, true, "Schedule saved");
 }
 
 void handleSettings()
 {
-    String json;
-    json.reserve(160);
-    json = "{\"sensor\":" + String(sensorInterval / 1000);
-    json += ",\"record\":" + String(recordInterval);
-    json += ",\"upload\":" + String(uploadInterval / 1000);
-    json += ",\"fullDuty\":";
-    json += fullDutyCycle ? "true" : "false";
-    json += "}";
-    server.send(200, "application/json", json);
+    char b[112];
+    snprintf(b, sizeof(b), "{\"sensor\":%lu,\"record\":%lu,\"upload\":%lu,\"fullDuty\":%s}",
+             sensorInterval / 1000UL, recordInterval, uploadInterval / 1000UL,
+             fullDutyCycle ? "true" : "false");
+    sendJsonBuf(200, b);
 }
 
+// ---- live values ----------------------------------------------------------------
 static String jnum(float v, unsigned int dp) { return isnan(v) ? String("null") : String(v, dp); }
+
+static const char *numOrNull(char *o, size_t n, float v, int dp)
+{
+    if (isnan(v)) strlcpy(o, "null", n);
+    else          snprintf(o, n, "%.*f", dp, (double)v);
+    return o;
+}
 
 void handleData()
 {
-    String j;
-    j.reserve(420);
-    j = "{\"temp\":" + jnum(dispT1, 1) + ",\"humidity\":" + jnum(dispH1, 1);
-    j += ",\"temp2\":" + jnum(dispT2, 1) + ",\"humidity2\":" + jnum(dispH2, 1);
-    j += ",\"co2\":" + (dispCo2 >= 0 ? String(dispCo2) : String("null"));
-    j += ",\"battV\":" + String(batteryVoltage, 2);
-    j += ",\"battA\":" + String(battCurrentA, 3);
-    j += ",\"solW\":" + String(solarPowerW, 2);
-    j += ",\"audio\":" + String(audioPeak);
-    j += ",\"co2_ok\":";   j += (errFlags & ERR_CO2) ? "false" : "true";
-    j += ",\"batt_ok\":";  j += (errFlags & ERR_BATT) ? "false" : "true";
-    j += ",\"solar_ok\":"; j += solarPresent ? "true" : "false";
-    j += ",\"mic_ok\":";   j += (errFlags & ERR_MIC) ? "false" : "true";   // mic is powered off between uses
-    j += ",\"sd_ok\":";    j += sd_ok ? "true" : "false";
-    j += ",\"cloud_ok\":"; j += (!(errFlags & (ERR_AWS_UPLOAD | ERR_AUTH)) && uploadFailStreak == 0) ? "true" : "false";
-    j += ",\"mac\":\"" + String(deviceMac) + "\",\"fw\":\"" FW_VERSION "\"}";
-    server.send(200, "application/json", j);
+    // A dashboard is open: make sure the audio peak is reasonably fresh (read in loop(), not here).
+    if (millis() - audioPeakAt > AUDIO_PEAK_STALE_MS) micPeakRequested = true;
+
+    static char b[640];
+    char t1[16], h1[16], t2[16], h2[16], co2[16];
+    if (dispCo2 >= 0) snprintf(co2, sizeof(co2), "%d", dispCo2); else strcpy(co2, "null");
+    snprintf(b, sizeof(b),
+             "{\"temp\":%s,\"humidity\":%s,\"temp2\":%s,\"humidity2\":%s,\"co2\":%s,"
+             "\"battV\":%.2f,\"battA\":%.3f,\"solW\":%.2f,\"audio\":%ld,"
+             "\"co2_ok\":%s,\"batt_ok\":%s,\"solar_ok\":%s,\"mic_ok\":%s,\"sd_ok\":%s,\"cloud_ok\":%s}",
+             numOrNull(t1, sizeof(t1), dispT1, 1), numOrNull(h1, sizeof(h1), dispH1, 1),
+             numOrNull(t2, sizeof(t2), dispT2, 1), numOrNull(h2, sizeof(h2), dispH2, 1), co2,
+             (double)batteryVoltage, (double)battCurrentA, (double)solarPowerW, audioPeak,
+             (errFlags & ERR_CO2) ? "false" : "true",
+             (errFlags & ERR_BATT) ? "false" : "true",
+             solarPresent ? "true" : "false",
+             (errFlags & ERR_MIC) ? "false" : "true",   // the mic is powered off between uses
+             sd_ok ? "true" : "false",
+             (!(errFlags & (ERR_AWS_UPLOAD | ERR_AUTH)) && uploadFailStreak == 0) ? "true" : "false");
+    sendJsonBuf(200, b);
+}
+
+// ---- device / connection status (header, Device and Connectivity cards) -----------------
+void handleInfo()
+{
+    static char b[960];
+    char ssidE[72], reasonE[56], timeS[32] = "";
+    jsonEsc(ssidE, sizeof(ssidE), staSsid);
+    jsonEsc(reasonE, sizeof(reasonE), staLastFailReason());
+
+    const time_t now = time(nullptr);
+    if (now > MIN_VALID_EPOCH)
+    {
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        snprintf(timeS, sizeof(timeS), "%04d-%02d-%02d %02d:%02d:%02d",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    }
+
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    const unsigned long ms = millis();
+    const long lastAgo = staLastResult == 0 ? -1 : (long)((ms - staLastAt) / 1000UL);
+    const long upAgo   = everUploaded ? (long)((ms - lastUploadOkAt) / 1000UL) : -1;
+    const long untilUp = (long)(nextUploadAt - ms);
+    const char *cloud  = uploadFailStreak > 0 ? "retry" : (everUploaded ? "ok" : "never");
+
+    snprintf(b, sizeof(b),
+             "{\"device\":\"%s\",\"hive\":\"%s\",\"fw\":\"%s\",\"mac\":\"%s\",\"chip\":\"%s rev %d\","
+             "\"uptime\":%lu,\"time\":\"%s\",\"reboots\":%lu,\"mode\":\"%s\","
+             "\"ssid\":\"%s\",\"custom\":%s,\"passSet\":%s,\"sta\":\"%s\",\"rssi\":%d,"
+             "\"last\":\"%s\",\"lastAgo\":%ld,\"reason\":\"%s\",\"uploadAgo\":%ld,\"next\":%ld,"
+             "\"cloud\":\"%s\",\"backlog\":%s,\"apClients\":%d,\"heap\":%u,\"block\":%u,\"sd_pct\":%.1f}",
+             DEVICE_ID, hiveNo.c_str(), FW_VERSION, deviceMac, ESP.getChipModel(), (int)ESP.getChipRevision(),
+             (unsigned long)(ms / 1000UL), timeS, (unsigned long)rebootCount, fullDutyCycle ? "duty" : "normal",
+             ssidE, wifiIsCustom ? "true" : "false", staPass[0] ? "true" : "false",
+             connected ? "connected" : "idle", connected ? (int)WiFi.RSSI() : 0,
+             staLastResult > 0 ? "ok" : staLastResult < 0 ? "failed" : "never", lastAgo, reasonE, upAgo,
+             untilUp > 0 ? untilUp / 1000L : 0L,
+             cloud, uploadBacklog ? "true" : "false", (int)WiFi.softAPgetStationNum(),
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (double)sdUsagePercent());
+    sendJsonBuf(200, b);
+}
+
+// ---- Wi-Fi (station / MiFi) credentials, stored in NVS -----------------------------------
+static void loadWifiCredentials()
+{
+    const String s = prefs.getString("wssid", "");
+    if (s.length() > 0 && s.length() <= 32)
+    {
+        strlcpy(staSsid, s.c_str(), sizeof(staSsid));
+        strlcpy(staPass, prefs.getString("wpass", "").c_str(), sizeof(staPass));
+        wifiIsCustom = true;
+    }
+}
+
+void handleWifiSave()
+{
+    if (server.hasArg("reset"))
+    {
+        prefs.remove("wssid");
+        prefs.remove("wpass");
+        strlcpy(staSsid, WIFI_SSID, sizeof(staSsid));
+        strlcpy(staPass, WIFI_PASS, sizeof(staPass));
+        wifiIsCustom = false;
+    }
+    else
+    {
+        const String ns = server.arg("ssid");
+        const String np = server.arg("pass");
+        const bool open = server.arg("open") == "1";
+        if (ns.length() < 1 || ns.length() > 32)
+        { sendResult(400, false, "Network name must be 1 to 32 characters"); return; }
+        if (!open && np.length() == 0 && ns != String(staSsid))
+        { sendResult(400, false, "Enter the password, or tick Open network"); return; }
+        if (np.length() > 0 && (np.length() < 8 || np.length() > 63))
+        { sendResult(400, false, "Password must be 8 to 63 characters"); return; }
+
+        strlcpy(staSsid, ns.c_str(), sizeof(staSsid));
+        if (open)                  staPass[0] = 0;
+        else if (np.length() > 0)  strlcpy(staPass, np.c_str(), sizeof(staPass));
+        prefs.putString("wssid", staSsid);
+        prefs.putString("wpass", staPass);
+        wifiIsCustom = true;
+    }
+
+    // Try the new network soon, and forget the old failures (they were about the old network).
+    staLastResult = 0;
+    uploadFailStreak = 0;
+    staFailStreak = 0;
+    nextUploadAt = millis() + 3000UL;
+    logPrintf(LV_OK, "Wi-Fi network set to \"%s\"%s", staSsid, wifiIsCustom ? "" : " (factory default)");
+    sendResult(200, true, "Saved. The device will try to connect in a few seconds.");
+}
+
+void handleWifiScan()
+{
+    // A scan moves the radio between channels: never while an upload is running.
+    if (WiFi.status() == WL_CONNECTED) { sendResult(409, false, "An upload is running. Try again in a minute."); return; }
+
+    const int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) { sendJsonBuf(200, "{\"state\":\"running\"}"); return; }
+    if (server.hasArg("start") || n < 0)
+    {
+        WiFi.scanDelete();
+        WiFi.scanNetworks(true, false, false, 200);
+        sendJsonBuf(200, "{\"state\":\"running\"}");
+        return;
+    }
+
+    // results are ready: strongest first, unique names, at most 16
+    int idx[24];
+    const int m = n < 24 ? n : 24;
+    for (int i = 0; i < m; i++) idx[i] = i;
+    for (int i = 1; i < m; i++)
+    {
+        const int k = idx[i];
+        int j = i - 1;
+        while (j >= 0 && WiFi.RSSI(idx[j]) < WiFi.RSSI(k)) { idx[j + 1] = idx[j]; j--; }
+        idx[j + 1] = k;
+    }
+
+    static char b[1400];
+    size_t o = snprintf(b, sizeof(b), "{\"state\":\"done\",\"nets\":[");
+    char names[16][33];
+    int emitted = 0;
+    for (int a = 0; a < m && emitted < 16; a++)
+    {
+        const int i = idx[a];
+        const String s = WiFi.SSID(i);
+        if (s.length() == 0 || s.length() > 32) continue;
+        bool dup = false;
+        for (int e = 0; e < emitted; e++) if (s == names[e]) { dup = true; break; }
+        if (dup) continue;
+        if (o + 130 > sizeof(b)) break;
+        strlcpy(names[emitted], s.c_str(), sizeof(names[0]));
+        char esc[72];
+        jsonEsc(esc, sizeof(esc), s.c_str());
+        o += snprintf(b + o, sizeof(b) - o, "%s{\"s\":\"%s\",\"r\":%d,\"o\":%d}", emitted ? "," : "",
+                      esc, (int)WiFi.RSSI(i), WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? 1 : 0);
+        emitted++;
+    }
+    snprintf(b + o, sizeof(b) - o, "]}");
+    WiFi.scanDelete();
+    sendJsonBuf(200, b);
+}
+
+// ---- maintenance ------------------------------------------------------------------------
+void handleUploadNow()
+{
+    nextUploadAt = millis();
+    sendResult(200, true, "Upload window starting now");
+}
+
+void handleReboot()
+{
+    sendResult(200, true, "Restarting");
+    delay(400);
+    ESP.restart();
+}
+
+void handleEvents()
+{
+    if (!sd_ok) { server.send(503, "text/plain", "SD card not available"); return; }
+    File f = SD.open(EVENT_LOG, FILE_READ);
+    if (!f) { server.send(404, "text/plain", "No warnings or errors recorded yet."); return; }
+    wdtFeed();
+    server.sendHeader("Content-Disposition", "attachment; filename=events.log");
+    server.streamFile(f, "text/plain");
+    f.close();
+    wdtFeed();
 }
 
 // ============================================================================
@@ -1145,7 +1454,7 @@ static CsvStats uploadCsvToAws(unsigned long budgetEndMs)
 
         strcpy(work, raw);
         Sample s;
-        if (!parseCsvRow(work, 0, at, s))
+        if (!parseCsvRow(work, LOCAL_OFFSET_SEC, at, s))
         {
             quarantineRow(raw); st.skipped++; continue;
         }
@@ -1509,6 +1818,8 @@ static MediaResult uploadMediaItem(MediaItem &it, const std::function<void()> &s
         }
         logPrintf(LV_OK, "Media step1 OK. Key: %s", s3Key);
 
+        uint32_t putMs = 0;
+        for (int attempt = 0; attempt < 2; attempt++)   // a mobile link can drop mid-transfer: retry once
         {
             WiFiClientSecure tls;
             if (String(uploadUrl).indexOf("amazonaws.com") >= 0) tls.setCACert(AWS_ROOT_CA);
@@ -1522,12 +1833,18 @@ static MediaResult uploadMediaItem(MediaItem &it, const std::function<void()> &s
             if (!f) { sdFault("cannot reopen media"); return MEDIA_RETRY_LATER; }
             wdtFeed();
             WdtFileStream ws(f);
-            DBG_T0(putT0);
+            const uint32_t putT0 = millis();
             code = http.sendRequest("PUT", &ws, f.size());
-            DBG("MEDIA step2: HTTP %d in %lu ms", code, (unsigned long)(millis() - putT0));
+            putMs = millis() - putT0;
+            DBG("MEDIA step2: HTTP %d in %lu ms", code, (unsigned long)putMs);
             f.close();
             http.end();
             wdtFeed();
+            if (code > 0 || WiFi.status() != WL_CONNECTED) break;   // the server answered, or the link is gone
+            tls.stop();
+            logPrintf(LV_WARN, "Media step2: transfer error %d, retrying once", code);
+            server.handleClient();
+            delay(1500);
         }
 
         if (code != 204 && code != 200)
@@ -1538,7 +1855,8 @@ static MediaResult uploadMediaItem(MediaItem &it, const std::function<void()> &s
         }
         it.s3Key = s3Key;
         saveProgress();   // crash-safe: the file is on S3, never upload it again
-        logMsg(LV_OK, "Media step2 OK");
+        logPrintf(LV_OK, "Media step2 OK (%lu kB in %.1f s, %.1f kB/s)", (unsigned long)(fileSize / 1024UL),
+                  putMs / 1000.0, putMs ? (fileSize / 1024.0) / (putMs / 1000.0) : 0.0);
     }
 
     char body[384];
@@ -1980,6 +2298,16 @@ static bool recordAndEnqueue()
 // ============================================================================
 // SAMPLE + LOG
 // ============================================================================
+// Dashboard-only measurement. The microphone is powered only for a recording, or briefly here
+// while somebody has the dashboard open (powering it every sample for nobody wastes energy).
+static void refreshAudioPeak()
+{
+    powerOnMicrophone();
+    audioPeak = readMicrophonePeak();
+    powerOffMicrophone();
+    audioPeakAt = millis();
+}
+
 static void enterBatteryHardStop()
 {
     rtcBattHardStop = true;
@@ -2004,9 +2332,8 @@ static void sampleAndLog()
     battSampled = !(errFlags & ERR_BATT);
     if (solarPresent) solarPowerW = solarSensor.getPower_mW() / 1000.0f;
 
-    powerOnMicrophone();
-    audioPeak = readMicrophonePeak();
-    powerOffMicrophone();
+    const bool dashboardOpen = WiFi.softAPgetStationNum() > 0;
+    if (dashboardOpen) refreshAudioPeak();
 
     // dashboard shows the most recent good value (display only; never written to CSV)
     if (!isnan(s.t1)) { dispT1 = s.t1; dispH1 = s.h1; }
@@ -2019,11 +2346,13 @@ static void sampleAndLog()
     else
     {
         const LogResult lr = logToCSV(s);
+        char peakStr[12];
+        if (dashboardOpen) snprintf(peakStr, sizeof(peakStr), "%ld", audioPeak); else strcpy(peakStr, "--");
         logPrintf(lr == LOG_SAVED ? LV_OK : lr == LOG_BUFFERED ? LV_WARN : LV_ERR,
-                      "Sample %s: T1=%s H1=%s T2=%s H2=%s CO2=%s Batt=%.2fV peak=%ld",
+                      "Sample %s: T1=%s H1=%s T2=%s H2=%s CO2=%s Batt=%.2fV peak=%s",
                       lr == LOG_SAVED ? "saved" : lr == LOG_BUFFERED ? "buffered" : "NOT saved",
                       jnum(s.t1, 1).c_str(), jnum(s.h1, 1).c_str(), jnum(s.t2, 1).c_str(), jnum(s.h2, 1).c_str(),
-                      s.co2 >= 0 ? String(s.co2).c_str() : "--", batteryVoltage, audioPeak);
+                      s.co2 >= 0 ? String(s.co2).c_str() : "--", batteryVoltage, peakStr);
     }
 
     if (lastBatteryVoltage > 0 && lastBatteryVoltage < BATT_HARD_CUTOFF_V) enterBatteryHardStop();
@@ -2037,24 +2366,38 @@ static void uploadWindow()
     logMsg(LV_INFO, "===== UPLOAD WINDOW =====");
     wdtFeed();
     const unsigned long budgetEnd = millis() + UPLOAD_BUDGET_MS;
-    bool failed = false, more = false;
+    bool failed = false, more = false, heapSkip = false;
 
     if (!heapOkForTls())
     {
+        heapSkip = true;
+        failed = true;
         lowHeapStreak++;
         setErr(ERR_HEAP_LOW, true);
-        noteError("Heap too low for TLS (maxBlock " + String((unsigned)ESP.getMaxAllocHeap()) + ")");
-        if (lowHeapStreak >= LOW_HEAP_RESTARTS) { logMsg(LV_ERR, "Restarting: heap fragmentation"); delay(100); ESP.restart(); }
-        failed = true;
+        noteError("Heap too low for TLS (largest block " + String((unsigned)ESP.getMaxAllocHeap()) + " bytes)");
+        if (lowHeapStreak >= LOW_HEAP_RESTARTS)
+        {
+            logMsg(LV_ERR, "Restarting: heap fragmentation");
+            delay(100);
+            ESP.restart();
+        }
     }
     else
     {
         lowHeapStreak = 0;
         setErr(ERR_HEAP_LOW, false);
 
-        if (!staEnsure()) { failed = true; noteError("WiFi: router not reachable"); }
+        if (!staEnsure())
+        {
+            failed = true;
+            if (staFailStreak < 250) staFailStreak++;
+            char m[112];
+            snprintf(m, sizeof(m), "WiFi: cannot join \"%s\" (%s)", ssid, staLastFailReason());
+            noteError(m);
+        }
         else
         {
+            staFailStreak = 0;
             gatewayRetries = GATEWAY_RETRIES_PER_WINDOW;
             syncClockIfNeeded();
             wdtFeed();
@@ -2078,16 +2421,18 @@ static void uploadWindow()
                 if (ms.retryLater) failed = true;
                 if (ms.more) more = true;
             }
-            disconnectSTA();   // radio-on time is the main power cost: release the router after every window
+            disconnectSTA();    // radio-on time is the main power cost: release the router after every window
+            restoreTxPower();
         }
     }
 
     if (failed) { if (uploadFailStreak < 250) uploadFailStreak++; }
-    else uploadFailStreak = 0;
+    else        { uploadFailStreak = 0; lastUploadOkAt = millis(); everUploaded = true; }
     uploadBacklog = failed || more;
 
     unsigned long delayMs;
-    if (failed)
+    if (heapSkip) delayMs = HEAP_RETRY_MS;
+    else if (failed)
     {
         const uint8_t sh = uploadFailStreak > 6 ? 6 : uploadFailStreak;
         uint64_t d = (uint64_t)uploadInterval << sh;
@@ -2100,6 +2445,15 @@ static void uploadWindow()
     nextUploadAt = millis() + delayMs;
 
     logPrintf(failed ? LV_WARN : LV_OK, "===== WINDOW DONE (%s), next in %lu s =====", failed ? "retry" : "ok", delayMs / 1000UL);
+
+    // The network has been unreachable for many windows in a row (MiFi moved, radio stack stuck):
+    // a restart rebuilds the radio stack. Never while somebody is using the dashboard.
+    if (staFailStreak >= OFFLINE_RESTART_STREAK && WiFi.softAPgetStationNum() == 0)
+    {
+        logMsg(LV_ERR, "Network unreachable for many windows: restarting");
+        delay(200);
+        ESP.restart();
+    }
 }
 
 // ============================================================================
@@ -2125,6 +2479,7 @@ void normalLoop()
         if (!battLow) recordAndEnqueue();
     }
 
+    if (micPeakRequested) { micPeakRequested = false; refreshAudioPeak(); }
     if (reached(nextUploadAt)) uploadWindow();
 
     if (millis() - lastHousekeeping > HOUSEKEEP_MS) { lastHousekeeping = millis(); mediaHousekeeping(); }
@@ -2153,6 +2508,7 @@ void dutyCycleLoop()
 
     if (reached(nextSensorAt)) { nextSensorAt = millis() + sensorInterval; sampleAndLog(); }
     if (reached(nextRecordAt)) { nextRecordAt = millis() + recordInterval * 1000UL; if (!battLow) recordAndEnqueue(); }
+    if (micPeakRequested) { micPeakRequested = false; refreshAudioPeak(); }
     if (reached(nextUploadAt)) uploadWindow();
     if (millis() - lastHousekeeping > HOUSEKEEP_MS) { lastHousekeeping = millis(); mediaHousekeeping(); }
 
@@ -2185,6 +2541,7 @@ void dutyCycleLoop()
 // ============================================================================
 void setup()
 {
+    setCpuFrequencyMhz(HIVE_CPU_MHZ);
     Serial.begin(115200);
     delay(200);
     pinMode(LED_PIN, OUTPUT);
@@ -2200,9 +2557,11 @@ void setup()
     wdtBegin();
     prefs.begin("duty", false);   // same namespace as the previous firmware: settings and boot counter survive
     loadSettings();
+    loadWifiCredentials();
     logPrintf(LV_INFO, "Schedule: sensor %lus  record %lus  upload %lus  mode %s",
                   sensorInterval / 1000UL, recordInterval, uploadInterval / 1000UL,
                   fullDutyCycle ? "duty-cycle" : "normal");
+    logPrintf(LV_INFO, "Wi-Fi network: \"%s\" (%s)", ssid, wifiIsCustom ? "saved on the dashboard" : "factory default");
     rebootCount = prefs.getULong("boots", 0);
     if (!wokeFromSleep) { rebootCount++; prefs.putULong("boots", rebootCount); }   // sleep wake-ups are not reboots
 
@@ -2242,17 +2601,28 @@ void setup()
     updateBatteryGuard();
 
     setupSDCard();
+    logSetSink(eventSink);
+    logPrintf(LV_INFO, "[BOOT] reset reason: %s (code %d)", bootResetCode ? bootResetCode : "normal", (int)rr);
 
     if (!String(AWS_API_BASE).startsWith("https://") || !String(ADEMNEA_BASE).startsWith("https://"))
         noteError("Config: gateway/AdEMNEA URL must be https://");
 
     startAP();   // connection.cpp
     server.on("/", HTTP_GET, handleRoot);
+    server.on("/app.css", HTTP_GET, handleCss);
+    server.on("/app.js", HTTP_GET, handleJs);
+    server.on("/favicon.ico", HTTP_GET, []() { server.send(204); });
     server.on("/data", HTTP_GET, handleData);
+    server.on("/info", HTTP_GET, handleInfo);
     server.on("/logs", HTTP_GET, handleLogs);
+    server.on("/events", HTTP_GET, handleEvents);
     server.on("/settingsPage", HTTP_GET, handleSettingsPage);
     server.on("/settings", HTTP_GET, handleSettings);
-    server.on("/setDuty", HTTP_GET, handleSetDuty);
+    server.on("/setDuty", handleSetDuty);                       // GET or POST
+    server.on("/wifi", HTTP_POST, handleWifiSave);
+    server.on("/wifiscan", HTTP_GET, handleWifiScan);
+    server.on("/api/uploadNow", HTTP_POST, handleUploadNow);
+    server.on("/api/reboot", HTTP_POST, handleReboot);
     server.begin();
 
     logDeviceIdentity();
@@ -2264,6 +2634,7 @@ void setup()
         gatewayRetries = GATEWAY_RETRIES_PER_WINDOW;
         syncClockIfNeeded();
         disconnectSTA();
+        restoreTxPower();
     }
     wdtFeed();
 

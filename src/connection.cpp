@@ -45,10 +45,14 @@ static inline void wdtPet() { esp_task_wdt_reset(); } // harmless if this task i
 // ======================================================
 void startAP()
 {
-    // Never write WiFi settings to flash: this firmware switches modes on every
-    // upload window and would otherwise wear the NVS partition.
+    // Never write WiFi settings to flash: this firmware connects on every upload window
+    // and would otherwise wear the NVS partition.
     WiFi.persistent(false);
-    WiFi.mode(WIFI_AP);
+    // AP+STA from the start and NEVER switched again: tearing the station interface down and
+    // up on every upload window fragments the heap (largest free block fell from 110 kB to
+    // 40-60 kB) and kicks dashboard clients. The idle station costs nothing.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setAutoReconnect(false);   // we connect ourselves, only inside upload windows
 
     WiFi.softAP(HIVE_AP_SSID, HIVE_AP_PASS);
 
@@ -58,12 +62,18 @@ void startAP()
 // ======================================================
 // CONNECTING TO STA
 // ======================================================
+static char failReason[32] = "";
+const char *staLastFailReason() { return failReason; }
+
 bool connectSTA()
 {
-    logMsg(LV_INFO, "Starting STA...");
+    logPrintf(LV_INFO, "Connecting to \"%s\"...", ssid);
 
     WiFi.persistent(false);
-    WiFi.mode(WIFI_AP_STA);
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);   // full power to join; main.cpp lowers it on a strong link
+    failReason[0] = 0;
     WiFi.begin(ssid, password);
 
     const unsigned long start = millis();
@@ -77,11 +87,15 @@ bool connectSTA()
         if (millis() - start > STA_CONNECT_TIMEOUT_MS)
         {
             Serial.println();
-            logMsg(LV_WARN, "STA connection failed (timeout)");
-            // Stop the background retry loop: otherwise the radio keeps scanning
-            // (power drain, SoftAP channel hopping) until the next window.
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_AP);
+            switch (WiFi.status())
+            {
+            case WL_NO_SSID_AVAIL: strlcpy(failReason, "network not found", sizeof(failReason)); break;
+            case WL_CONNECT_FAILED: strlcpy(failReason, "wrong password or rejected", sizeof(failReason)); break;
+            default:               strlcpy(failReason, "no response (timeout)", sizeof(failReason)); break;
+            }
+            logPrintf(LV_WARN, "STA connection failed: %s", failReason);
+            // Stop connecting, but leave the station interface initialised (see startAP()).
+            WiFi.disconnect(false);
             return false;
         }
 
@@ -100,10 +114,9 @@ bool connectSTA()
 // ======================================================
 void disconnectSTA()
 {
-    WiFi.disconnect(true);                         // drops the STA connection
-    // Stay in WIFI_AP_STA so the SoftAP never goes down and
-    // connected dashboard clients are not kicked on every upload window.
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    // Drops the association only. The station interface and the SoftAP stay up, so dashboard
+    // clients are not kicked and the heap is not churned on every upload window.
+    WiFi.disconnect(false);
 
     logMsg(LV_INFO, "STA disconnected");
 }
